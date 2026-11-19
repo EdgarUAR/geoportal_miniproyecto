@@ -1,0 +1,11 @@
+# Credenciales locales (no se versionan)
+config/local.php
+
+# Registros y archivos temporales
+*.log
+*.tmp
+
+# Sistema operativo
+Thumbs.db
+.DS_Store
+desktop.ini
