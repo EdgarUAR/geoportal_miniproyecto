@@ -50,6 +50,181 @@
         ruta: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18c3 0 3-12 6-12s3 12 6 12 3-6 6-6"/><circle cx="3" cy="18" r="1.4"/><circle cx="21" cy="12" r="1.4"/></svg>',
     };
 
+    /* Rampa térmica del mapa de calor: azul → cian → verde → amarillo → rojo. */
+    const RAMP_CALOR = [
+        [0.00, [12, 56, 140]],
+        [0.22, [0, 168, 212]],
+        [0.45, [38, 168, 86]],
+        [0.68, [244, 196, 48]],
+        [1.00, [206, 38, 38]],
+    ];
+
+    function colorCalor(t) {
+        const x = Math.max(0, Math.min(1, Number(t) || 0));
+        for (let i = 1; i < RAMP_CALOR.length; i += 1) {
+            const [fin, colorFin] = RAMP_CALOR[i];
+            const [inicio, colorInicio] = RAMP_CALOR[i - 1];
+            if (x <= fin) {
+                const f = (x - inicio) / (fin - inicio || 1);
+                return colorInicio.map((valor, j) => Math.round(valor + (colorFin[j] - valor) * f));
+            }
+        }
+        return RAMP_CALOR[RAMP_CALOR.length - 1][1];
+    }
+
+    /**
+     * Capa de mapa de calor dibujada en Canvas puro (sin plugins ni CDN).
+     * Acumula intensidad con gradientes radiales y recolorea el canal alfa.
+     */
+    const CapaCalorCanvas = L.Layer.extend({
+        options: {
+            pane: 'calor',
+            opacidad: 0.78,
+        },
+
+        initialize(opciones = {}) {
+            L.Util.setOptions(this, opciones);
+            this._puntos = [];
+            this._raf = null;
+        },
+
+        onAdd(mapa) {
+            this._mapa = mapa;
+            const canvas = this._canvas = L.DomUtil.create('canvas', 'leaflet-capa-calor');
+            canvas.style.position = 'absolute';
+            canvas.style.left = '0';
+            canvas.style.top = '0';
+            canvas.style.pointerEvents = 'none';
+
+            const pane = mapa.getPane(this.options.pane) || mapa.getPane('overlayPane');
+            if (pane) pane.appendChild(canvas);
+
+            // 'move' mantiene el canvas pegado al origen visible mientras se
+            // arrastra el mapa; 'viewreset' cubre los cambios de proyección.
+            mapa.on('move viewreset moveend zoomend resize', this._programar, this);
+            mapa.on('zoomstart', this._ocultarEnZoom, this);
+            mapa.on('zoomend', this._mostrarTrasZoom, this);
+            this._redibujar();
+            return this;
+        },
+
+        onRemove(mapa) {
+            mapa.off('move viewreset moveend zoomend resize', this._programar, this);
+            mapa.off('zoomstart', this._ocultarEnZoom, this);
+            mapa.off('zoomend', this._mostrarTrasZoom, this);
+            if (this._raf) {
+                cancelAnimationFrame(this._raf);
+                this._raf = null;
+            }
+            if (this._canvas && this._canvas.parentNode) {
+                this._canvas.parentNode.removeChild(this._canvas);
+            }
+            this._canvas = null;
+            this._mapa = null;
+            return this;
+        },
+
+        setPuntos(puntos) {
+            this._puntos = Array.isArray(puntos)
+                ? puntos.filter((p) => Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lon)))
+                : [];
+            this._programar();
+            return this;
+        },
+
+        _ocultarEnZoom() {
+            if (this._canvas) this._canvas.style.visibility = 'hidden';
+        },
+
+        _mostrarTrasZoom() {
+            if (this._canvas) this._canvas.style.visibility = '';
+            this._programar();
+        },
+
+        _programar() {
+            if (this._raf) return;
+            this._raf = requestAnimationFrame(() => {
+                this._raf = null;
+                this._redibujar();
+            });
+        },
+
+        _redibujar() {
+            const mapa = this._mapa;
+            const canvas = this._canvas;
+            if (!mapa || !canvas) return;
+
+            const tam = mapa.getSize();
+            if (!tam.x || !tam.y) return;
+
+            // El pane 'calor' se mueve con .leaflet-map-pane (translate3d).
+            // Anclar el canvas al origen visible evita el desfase al arrastrar.
+            const esquina = mapa.containerPointToLayerPoint([0, 0]);
+            L.DomUtil.setPosition(canvas, esquina);
+
+            const dpr = Math.min(window.devicePixelRatio || 1, 2);
+            const ancho = Math.round(tam.x * dpr);
+            const alto = Math.round(tam.y * dpr);
+            if (canvas.width !== ancho || canvas.height !== alto) {
+                canvas.width = ancho;
+                canvas.height = alto;
+                canvas.style.width = `${tam.x}px`;
+                canvas.style.height = `${tam.y}px`;
+            }
+
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            if (!ctx) return;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, tam.x, tam.y);
+
+            const puntos = this._puntos || [];
+            if (!puntos.length) return;
+
+            const zoom = mapa.getZoom();
+            const radioBase = Math.max(16, Math.min(78, 16 + (zoom - 11) * 8));
+            const maxPeso = Math.max(1, ...puntos.map((p) => Number(p.peso) || 1));
+
+            // Acumulación de intensidad: gradientes negros con alfa + 'lighter'.
+            ctx.globalCompositeOperation = 'lighter';
+            puntos.forEach((punto) => {
+                const px = mapa.latLngToContainerPoint([Number(punto.lat), Number(punto.lon)]);
+                const margen = radioBase * 2;
+                if (px.x < -margen || px.y < -margen || px.x > tam.x + margen || px.y > tam.y + margen) return;
+
+                const peso = Math.max(0.15, (Number(punto.peso) || 1) / maxPeso);
+                const radio = radioBase * (0.72 + 0.5 * peso);
+                const alfa = 0.14 + 0.3 * peso;
+                const gradiente = ctx.createRadialGradient(px.x, px.y, 0, px.x, px.y, radio);
+                gradiente.addColorStop(0, `rgba(0,0,0,${alfa.toFixed(3)})`);
+                gradiente.addColorStop(0.55, `rgba(0,0,0,${(alfa * 0.55).toFixed(3)})`);
+                gradiente.addColorStop(1, 'rgba(0,0,0,0)');
+                ctx.fillStyle = gradiente;
+                ctx.beginPath();
+                ctx.arc(px.x, px.y, radio, 0, Math.PI * 2);
+                ctx.fill();
+            });
+            ctx.globalCompositeOperation = 'source-over';
+
+            // Recolorear según la intensidad acumulada en el canal alfa.
+            const imagen = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const datos = imagen.data;
+            for (let i = 3; i < datos.length; i += 4) {
+                const alfa = datos[i];
+                if (alfa < 6) {
+                    datos[i] = 0;
+                    continue;
+                }
+                const t = Math.min(1, Math.pow(alfa / 150, 0.75));
+                const [r, g, b] = colorCalor(t);
+                datos[i - 3] = r;
+                datos[i - 2] = g;
+                datos[i - 1] = b;
+                datos[i] = Math.min(235, Math.round(alfa * 1.45 * this.options.opacidad));
+            }
+            ctx.putImageData(imagen, 0, 0);
+        },
+    });
+
     const ETIQUETAS = {
         terminal: 'Terminal',
         base: 'Base',
@@ -85,7 +260,18 @@
         filtroColonias: 'todas',
         busquedaColonia: '',
         paradasTodas: true,
+        filtroTipoParada: 'todas',
+        filtroTipoColonia: 'todos',
+        modoCalor: 'transporte',
+        calorActivo: false,
+        capaCalor: null,
+        modoAgregar: false,
+        popupAgregar: null,
+        tabActual: 'tablero',
+        coloniasFinanciadas: new Set(),
+        circuloAnalisis: null,
         radio: Number(CFG_MAPA.radio_m) || 300,
+        radioTimer: null,
         inversion: {
             presupuesto: Number(CFG_INV.presupuesto_sugerido) || 300000,
             costoKm: Number(CFG_INV.costo_km) || 350000,
@@ -362,12 +548,15 @@
 
         mapa.createPane('basemap');
         mapa.createPane('basemapLabels');
+        mapa.createPane('calor');
         mapa.createPane('colonias');
         mapa.createPane('rutas');
         mapa.createPane('paradas');
         mapa.createPane('analisis');
         mapa.getPane('basemap').style.zIndex = 100;
         mapa.getPane('basemapLabels').style.zIndex = 200;
+        mapa.getPane('calor').style.zIndex = 380;
+        mapa.getPane('calor').style.pointerEvents = 'none';
         mapa.getPane('colonias').style.zIndex = 360;
         mapa.getPane('rutas').style.zIndex = 400;
         mapa.getPane('paradas').style.zIndex = 450;
@@ -407,7 +596,16 @@
         cambiarBasemap('claro', false);
 
         mapa.on('click', (evento) => {
-            analizar(evento.latlng.lng, evento.latlng.lat, { ajustar: false, origen: 'mapa' });
+            if (Estado.modoAgregar) {
+                abrirFormularioParada(evento.latlng);
+                return;
+            }
+            if (Estado.tabActual === 'consulta') {
+                analizar(evento.latlng.lng, evento.latlng.lat, { ajustar: false, origen: 'mapa' });
+                return;
+            }
+            // Fuera de Consulta, un clic en zona vacía sólo cierra los popups.
+            mapa.closePopup();
         });
     }
 
@@ -443,6 +641,122 @@
     }
 
     /* ---------------------------------------------------------------------- */
+    /* Mapa de calor                                                          */
+    /* ---------------------------------------------------------------------- */
+
+    function centroideFeature(feature) {
+        const geometria = feature?.geometry;
+        if (!geometria) return null;
+        if (geometria.type === 'Point') {
+            return { lon: Number(geometria.coordinates[0]), lat: Number(geometria.coordinates[1]) };
+        }
+
+        let anillo = null;
+        if (geometria.type === 'Polygon') anillo = geometria.coordinates[0];
+        else if (geometria.type === 'MultiPolygon') anillo = geometria.coordinates[0]?.[0];
+        if (!Array.isArray(anillo) || !anillo.length) return null;
+
+        const suma = anillo.reduce((acc, [x, y]) => {
+            acc.lon += Number(x) || 0;
+            acc.lat += Number(y) || 0;
+            return acc;
+        }, { lon: 0, lat: 0 });
+
+        return { lon: suma.lon / anillo.length, lat: suma.lat / anillo.length };
+    }
+
+    function puntosCalor() {
+        if (!Estado.datos) return [];
+        const puntos = [];
+
+        if (Estado.modoCalor === 'poblacion') {
+            Estado.datos.colonias.features.forEach((feature) => {
+                const centro = centroideFeature(feature);
+                if (!centro) return;
+                const p = feature.properties;
+                const peso = Math.max(1, Number(p.poblacion) || 0) * (p.cobertura ? 1 : 1.6);
+                puntos.push({ ...centro, peso });
+            });
+            return puntos;
+        }
+
+        // Densidad de servicio: paradas activas/propuestas + vértices de rutas activas.
+        Estado.datos.paradas.features.forEach((feature) => {
+            const p = feature.properties;
+            if (p.estatus !== 'activa' && p.estatus !== 'propuesta') return;
+            const [lon, lat] = feature.geometry.coordinates;
+            puntos.push({ lon, lat, peso: 1 + (p.rutas || []).length });
+        });
+
+        Estado.datos.rutas.features.forEach((feature) => {
+            if (!feature.properties.activa) return;
+            const geometria = feature.geometry;
+            const lineas = geometria.type === 'LineString'
+                ? [geometria.coordinates]
+                : geometria.type === 'MultiLineString' ? geometria.coordinates : [];
+
+            lineas.forEach((coords) => {
+                coords.forEach(([lon, lat], indice) => {
+                    puntos.push({ lon, lat, peso: 1 });
+                    if (indice === 0) return;
+                    const [lon0, lat0] = coords[indice - 1];
+                    const dx = lon - lon0;
+                    const dy = lat - lat0;
+                    const tramos = Math.min(24, Math.max(1, Math.round(Math.hypot(dx, dy) / 0.0012)));
+                    for (let k = 1; k < tramos; k += 1) {
+                        const f = k / tramos;
+                        puntos.push({ lon: lon0 + dx * f, lat: lat0 + dy * f, peso: 0.55 });
+                    }
+                });
+            });
+        });
+
+        return puntos;
+    }
+
+    function actualizarCalor() {
+        if (!Estado.capaCalor) return;
+        Estado.capaCalor.setPuntos(puntosCalor());
+    }
+
+    function alternarCalor(activo, avisar = true) {
+        Estado.calorActivo = Boolean(activo);
+
+        const checkbox = $('#chkCalor');
+        if (checkbox) checkbox.checked = Estado.calorActivo;
+        $$('#btnCalor').forEach((boton) => {
+            boton.classList.toggle('is-activo', Estado.calorActivo);
+            boton.setAttribute('aria-pressed', String(Estado.calorActivo));
+        });
+
+        if (Estado.calorActivo) {
+            if (!Estado.capaCalor) Estado.capaCalor = new CapaCalorCanvas({ pane: 'calor' });
+            if (!Estado.mapa.hasLayer(Estado.capaCalor)) {
+                Estado.capaCalor.addTo(Estado.mapa);
+            }
+            actualizarCalor();
+            if (avisar) {
+                toast(`Mapa de calor: ${Estado.modoCalor === 'poblacion' ? 'población y demanda' : 'paradas y rutas'}`);
+            }
+        } else {
+            if (Estado.capaCalor && Estado.mapa.hasLayer(Estado.capaCalor)) {
+                Estado.mapa.removeLayer(Estado.capaCalor);
+            }
+            if (avisar) toast('Mapa de calor desactivado');
+        }
+    }
+
+    function cambiarModoCalor(modo, avisar = true) {
+        Estado.modoCalor = modo === 'poblacion' ? 'poblacion' : 'transporte';
+        if (Estado.calorActivo) {
+            actualizarCalor();
+            if (avisar) {
+                toast(`Mapa de calor: ${Estado.modoCalor === 'poblacion' ? 'población y demanda' : 'paradas y rutas'}`);
+            }
+        }
+    }
+
+    /* ---------------------------------------------------------------------- */
     /* Indicadores del tablero                                                */
     /* ---------------------------------------------------------------------- */
 
@@ -470,9 +784,12 @@
 
     function filtrarColonias(valor) {
         Estado.filtroColonias = valor;
+        Estado.filtroTipoColonia = 'todos';
         Estado.busquedaColonia = '';
         const input = $('#buscarColonia');
         if (input) input.value = '';
+        const selectTipo = $('#filtroTipoColonia');
+        if (selectTipo) selectTipo.value = 'todos';
         marcarSegmentado('#filtroColonias', valor);
         aplicarFiltroColonias();
         pintarListaColonias();
@@ -548,6 +865,26 @@
     /* Capas                                                                  */
     /* ---------------------------------------------------------------------- */
 
+    function paradaPasaFiltros(p) {
+        if (!Estado.paradasTodas && p.estatus !== 'activa') return false;
+        if (Estado.filtroTipoParada !== 'todas' && p.tipo !== Estado.filtroTipoParada) return false;
+        return true;
+    }
+
+    function coloniaPasaFiltros(c) {
+        if (Estado.filtroTipoColonia !== 'todos' && c.tipo !== Estado.filtroTipoColonia) return false;
+        if (Estado.filtroColonias === 'con' && !c.cobertura) return false;
+        if (Estado.filtroColonias === 'sin' && c.cobertura) return false;
+        return true;
+    }
+
+    function abrirPopupColonia(layer) {
+        if (!layer.getPopup()) {
+            layer.bindPopup(() => popupColonia(layer.feature.properties), { maxWidth: 300 });
+        }
+        layer.openPopup();
+    }
+
     function crearCapas() {
         const mapa = Estado.mapa;
 
@@ -556,8 +893,23 @@
             style: estiloColonia,
             onEachFeature: (feature, layer) => {
                 const p = feature.properties;
-                layer.bindPopup(() => popupColonia(p), { maxWidth: 300 });
                 layer.bindTooltip(p.nombre, { direction: 'top', sticky: true, opacity: 0.92 });
+                layer.on('click', (evento) => {
+                    // El clic sobre una colonia nunca debe analizar y abrir su ficha a la vez.
+                    L.DomEvent.stopPropagation(evento);
+                    if (Estado.modoAgregar) {
+                        layer.closePopup();
+                        abrirFormularioParada(evento.latlng);
+                        return;
+                    }
+                    if (Estado.tabActual === 'consulta') {
+                        // En Consulta el clic sobre el polígono define el punto de análisis.
+                        layer.closePopup();
+                        analizar(evento.latlng.lng, evento.latlng.lat, { ajustar: false, origen: 'mapa' });
+                        return;
+                    }
+                    abrirPopupColonia(layer);
+                });
                 layer.on('mouseover', () => {
                     if (Estado.analisis) return;
                     layer.setStyle({
@@ -579,6 +931,14 @@
                 const p = feature.properties;
                 layer.bindPopup(() => popupRuta(p), { maxWidth: 320 });
                 layer.bindTooltip(`${p.clave} · ${p.nombre}`, { direction: 'top', sticky: true, opacity: 0.94 });
+                layer.on('click', (evento) => {
+                    // Inspeccionar una ruta no debe disparar el análisis de radio.
+                    L.DomEvent.stopPropagation(evento);
+                    if (Estado.modoAgregar) {
+                        layer.closePopup();
+                        abrirFormularioParada(evento.latlng);
+                    }
+                });
                 layer.on('mouseover', () => {
                     layer.setStyle({ weight: 8 });
                     layer.bringToFront();
@@ -593,7 +953,7 @@
         Estado.marcadores.clear();
         Estado.capaParadas = L.geoJSON(Estado.datos.paradas, {
             pane: 'paradas',
-            filter: (feature) => Estado.paradasTodas || feature.properties.estatus === 'activa',
+            filter: (feature) => paradaPasaFiltros(feature.properties),
             pointToLayer: (feature, latlng) => L.marker(latlng, {
                 icon: iconoParada(feature.properties),
                 riseOnHover: true,
@@ -606,6 +966,13 @@
                 const [lon, lat] = feature.geometry.coordinates;
                 layer.bindPopup(() => popupParada(p, lon, lat), { maxWidth: 300 });
                 layer.bindTooltip(p.nombre, { direction: 'top', offset: [0, -14], opacity: 0.94 });
+                layer.on('click', (evento) => {
+                    L.DomEvent.stopPropagation(evento);
+                    if (Estado.modoAgregar) {
+                        layer.closePopup();
+                        abrirFormularioParada(evento.latlng);
+                    }
+                });
                 Estado.marcadores.set(p.clave, layer);
             },
         }).addTo(mapa);
@@ -615,6 +982,7 @@
         const chipRutas = $('#capaNumRutas');
         if (chipRutas) chipRutas.textContent = `${Estado.rutas.length}`;
         actualizarContadorParadas();
+        actualizarCalor();
     }
 
     function actualizarContadorParadas() {
@@ -626,6 +994,19 @@
 
     function estiloColonia(feature) {
         const p = feature.properties;
+        if (
+            Estado.tabActual === 'inversion'
+            && !p.cobertura
+            && Estado.coloniasFinanciadas.has(p.clave)
+        ) {
+            return {
+                color: '#c4760e',
+                weight: 2.2,
+                dashArray: '6 4',
+                fillColor: '#f7d9a0',
+                fillOpacity: 0.65,
+            };
+        }
         if (!p.cobertura) {
             return {
                 color: '#b0261c',
@@ -677,22 +1058,19 @@
     function reconstruirParadas() {
         if (!Estado.capaParadas) return;
         const visibles = Estado.datos.paradas.features.filter(
-            (f) => Estado.paradasTodas || f.properties.estatus === 'activa'
+            (f) => paradaPasaFiltros(f.properties)
         );
         Estado.capaParadas.clearLayers();
         Estado.marcadores.clear();
         Estado.capaParadas.addData({ type: 'FeatureCollection', features: visibles });
         actualizarContadorParadas();
+        actualizarCalor();
         if (Estado.analisis) resaltarCobertura(Estado.analisis);
     }
 
     function aplicarFiltroColonias() {
         if (!Estado.capaColonias) return;
-        const features = Estado.datos.colonias.features.filter((f) => {
-            if (Estado.filtroColonias === 'con') return f.properties.cobertura;
-            if (Estado.filtroColonias === 'sin') return !f.properties.cobertura;
-            return true;
-        });
+        const features = Estado.datos.colonias.features.filter((f) => coloniaPasaFiltros(f.properties));
 
         Estado.capaColonias.clearLayers();
         Estado.capaColonias.addData({ type: 'FeatureCollection', features });
@@ -735,8 +1113,8 @@
             </div>
             ${aviso}
             ${rutas.length ? `<div class="pop__chips">${rutas.map((r) => (
-                `<span class="pop__chip"><i style="background:${esc(r.color)}"></i>${esc(r.clave)}</span>`
-            )).join('')}</div>` : ''}
+            `<span class="pop__chip"><i style="background:${esc(r.color)}"></i>${esc(r.clave)}</span>`
+        )).join('')}</div>` : ''}
             <div class="pop__acciones">
                 <button type="button" class="pop__btn" data-accion="analizar-colonia" data-clave="${esc(p.clave)}">Analizar ${Estado.radio} m</button>
                 <button type="button" class="pop__btn pop__btn--linea" data-accion="ver-colonia" data-clave="${esc(p.clave)}">Ver ficha</button>
@@ -796,6 +1174,7 @@
             <div class="pop__acciones">
                 <button type="button" class="pop__btn" data-accion="analizar-punto" data-lon="${lon}" data-lat="${lat}">Analizar ${Estado.radio} m</button>
                 ${rutas.length ? `<button type="button" class="pop__btn pop__btn--linea" data-accion="ubicar-ruta" data-clave="${esc(rutas[0].clave)}">Ver ruta</button>` : ''}
+                <button type="button" class="pop__btn pop__btn--peligro" data-accion="eliminar-parada" data-clave="${esc(p.clave)}">Eliminar</button>
             </div>
         </div>`;
     }
@@ -860,6 +1239,10 @@
                 <div class="leyenda__item">
                     <span class="leyenda__poligono leyenda__poligono--sin"></span>
                     <span>Sin cobertura</span>
+                </div>
+                <div class="leyenda__item">
+                    <span class="leyenda__poligono leyenda__poligono--financiada"></span>
+                    <span>Financiada (simulador)</span>
                 </div>
                 <p class="leyenda__nota">El verde se intensifica con el número de rutas que cruzan la colonia. Lo rayado indica que ninguna ruta activa la cruza.</p>
             </div>`;
@@ -1238,7 +1621,7 @@
         const grupo = L.layerGroup();
         const [lat, lon] = [r.punto.lat, r.punto.lon];
 
-        L.circle([lat, lon], {
+        const circulo = L.circle([lat, lon], {
             radius: r.radio_m,
             color: COLORES.oro,
             weight: 2,
@@ -1248,6 +1631,7 @@
             interactive: false,
             pane: 'analisis',
         }).addTo(grupo);
+        Estado.circuloAnalisis = circulo;
 
         const icono = L.divIcon({
             className: '',
@@ -1331,6 +1715,7 @@
             Estado.mapa.removeLayer(Estado.grupoAnalisis);
         }
         Estado.grupoAnalisis = null;
+        Estado.circuloAnalisis = null;
         Estado.analisis = null;
         limpiarResaltado();
 
@@ -1341,7 +1726,7 @@
         if (panel) {
             panel.innerHTML = `<div class="vacio">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
-                <p>Selecciona un punto para ver las rutas a menos de <strong>${Estado.radio} m</strong> y las colonias relacionadas.</p>
+                <p>Selecciona un punto para ver las rutas a menos de <strong id="vacioRadio">${Estado.radio} m</strong> y las colonias relacionadas.</p>
             </div>`;
         }
         const coords = $('#consultaCoords');
@@ -1364,6 +1749,9 @@
         let capa = capaDeColonia(clave);
         if (!capa) {
             Estado.filtroColonias = 'todas';
+            Estado.filtroTipoColonia = 'todos';
+            const selectTipo = $('#filtroTipoColonia');
+            if (selectTipo) selectTipo.value = 'todos';
             marcarSegmentado('#filtroColonias', 'todas');
             aplicarFiltroColonias();
             pintarListaColonias();
@@ -1372,7 +1760,7 @@
         if (!capa) return;
         Estado.mapa.flyToBounds(capa.getBounds(), { maxZoom: 17, padding: [50, 50], duration: 0.55 });
         if (conPopup) {
-            setTimeout(() => capa.openPopup(), 420);
+            setTimeout(() => abrirPopupColonia(capa), 420);
         }
     }
 
@@ -1404,12 +1792,20 @@
         if (!marcador) {
             const parada = Estado.paradas.find((p) => p.clave === clave);
             if (!parada) return;
+            let rehacer = false;
             if (parada.estatus !== 'activa' && !Estado.paradasTodas) {
                 Estado.paradasTodas = true;
                 const check = $('#chkParadasTodas');
                 if (check) check.checked = true;
-                reconstruirParadas();
+                rehacer = true;
             }
+            if (Estado.filtroTipoParada !== 'todas' && parada.tipo !== Estado.filtroTipoParada) {
+                Estado.filtroTipoParada = 'todas';
+                const selectTipo = $('#filtroTipoParada');
+                if (selectTipo) selectTipo.value = 'todas';
+                rehacer = true;
+            }
+            if (rehacer) reconstruirParadas();
             marcador = Estado.marcadores.get(clave);
         }
         if (!marcador) return;
@@ -1422,14 +1818,267 @@
         setTimeout(() => marcador.openPopup(), 400);
     }
 
+    function activarModoAgregar(activo, avisar = true) {
+        Estado.modoAgregar = Boolean(activo);
+
+        ['#btnAgregarParada', '#btnAgregarParadaPanel'].forEach((selector) => {
+            const boton = $(selector);
+            if (!boton) return;
+            boton.classList.toggle('is-activo', Estado.modoAgregar);
+            boton.setAttribute('aria-pressed', String(Estado.modoAgregar));
+        });
+
+        if (Estado.mapa) {
+            Estado.mapa.getContainer().classList.toggle('is-agregando', Estado.modoAgregar);
+        }
+        $('#map')?.classList.toggle('is-agregando', Estado.modoAgregar);
+
+        const banner = $('#bannerModoAgregar');
+        if (banner) banner.hidden = !Estado.modoAgregar;
+
+        if (Estado.modoAgregar) {
+            if (Estado.mapa) Estado.mapa.closePopup();
+            if (avisar) toast('Modo agregar activo: haz clic en el mapa para ubicar la nueva parada');
+        } else {
+            if (Estado.popupAgregar && Estado.mapa) Estado.mapa.closePopup();
+            if (avisar) toast('Modo agregar desactivado');
+        }
+    }
+
+    function htmlFormularioParada(lat, lon) {
+        const tipos = ['parada_autorizada', 'base', 'terminal'].map((tipo) => (
+            `<option value="${tipo}"${tipo === 'parada_autorizada' ? ' selected' : ''}>${esc(etiqueta(tipo))}</option>`
+        )).join('');
+        const estatus = ['activa', 'propuesta', 'inactiva'].map((valor) => (
+            `<option value="${valor}"${valor === 'activa' ? ' selected' : ''}>${esc(etiqueta(valor))}</option>`
+        )).join('');
+
+        return `<form class="form-parada" id="formNuevaParada">
+            <p class="form-parada__titulo">Nueva parada</p>
+            <label class="campo">
+                <span>Nombre *</span>
+                <input type="text" name="nombre" required minlength="2" maxlength="120"
+                       placeholder="Ej. Parada Av. Lázaro Cárdenas" autocomplete="off">
+            </label>
+            <label class="campo">
+                <span>Categoría / tipo</span>
+                <select name="tipo">${tipos}</select>
+            </label>
+            <label class="campo">
+                <span>Estatus</span>
+                <select name="estatus">${estatus}</select>
+            </label>
+            <label class="campo">
+                <span>Referencia</span>
+                <input type="text" name="referencia" maxlength="180"
+                       placeholder="Calle o cruce de referencia" autocomplete="off">
+            </label>
+            <label class="check-parada">
+                <input type="checkbox" name="techada" value="on">
+                <span>Parada techada</span>
+            </label>
+            <p class="form-parada__coords">Lat ${lat.toFixed(6)}, Lon ${lon.toFixed(6)}</p>
+            <p class="form-parada__nota">Si está a ≤ 40 m de una ruta, PostGIS la vinculará automáticamente.</p>
+            <div class="form-parada__acciones">
+                <button type="submit" class="btn btn--guinda">Guardar parada</button>
+                <button type="button" class="btn btn--linea" id="btnCancelarParada">Cancelar</button>
+            </div>
+        </form>`;
+    }
+
+    function abrirFormularioParada(latlng) {
+        const mapa = Estado.mapa;
+        if (!mapa) return;
+        // Si ya había un formulario abierto, evita que su evento "remove"
+        // desactive el modo antes de abrir el nuevo.
+        if (Estado.popupAgregar) {
+            Estado.popupAgregar.off();
+            Estado.popupAgregar = null;
+        }
+        mapa.closePopup();
+
+        const popup = L.popup({
+            maxWidth: 330,
+            className: 'popup-agregar',
+            autoClose: false,
+            closeOnClick: false,
+            closeOnEscapeKey: true,
+        })
+            .setLatLng(latlng)
+            .setContent(htmlFormularioParada(latlng.lat, latlng.lng))
+            .openOn(mapa);
+
+        Estado.popupAgregar = popup;
+        popup.on('remove', () => {
+            Estado.popupAgregar = null;
+            if (Estado.modoAgregar) activarModoAgregar(false, false);
+        });
+
+        const formulario = $('#formNuevaParada');
+        if (!formulario) return;
+        formulario.addEventListener('submit', (evento) => guardarParada(evento, latlng));
+        $('#btnCancelarParada')?.addEventListener('click', () => {
+            mapa.closePopup();
+            // Cierra el modo de forma explícita, sin depender sólo del evento remove.
+            activarModoAgregar(false, false);
+        });
+        setTimeout(() => formulario.querySelector('input[name="nombre"]')?.focus(), 80);
+    }
+
+    async function guardarParada(evento, latlng) {
+        evento.preventDefault();
+        const formulario = evento.currentTarget;
+        if (!formulario.reportValidity()) return;
+
+        const datos = new FormData(formulario);
+        const carga = {
+            nombre: String(datos.get('nombre') || '').trim(),
+            tipo: String(datos.get('tipo') || 'parada_autorizada'),
+            estatus: String(datos.get('estatus') || 'activa'),
+            referencia: String(datos.get('referencia') || '').trim(),
+            techada: datos.get('techada') === 'on',
+            lon: Number(latlng.lng),
+            lat: Number(latlng.lat),
+        };
+
+        const boton = formulario.querySelector('button[type="submit"]');
+        if (boton) {
+            boton.disabled = true;
+            boton.textContent = 'Guardando…';
+        }
+
+        try {
+            const respuesta = await fetch(new URL(`${API}agregar_parada.php`, window.location.href).toString(), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                cache: 'no-store',
+                body: JSON.stringify(carga),
+            });
+            const texto = await respuesta.text();
+            let json;
+            try {
+                json = JSON.parse(texto);
+            } catch (e) {
+                throw new Error('El servidor no respondió con JSON válido.');
+            }
+            if (!respuesta.ok || !json.ok) {
+                throw new Error(json.error || `Error ${respuesta.status}`);
+            }
+
+            const creada = json.data?.parada;
+            const asociadas = Number(json.data?.rutas_asociadas) || 0;
+
+            Estado.mapa?.closePopup();
+            activarModoAgregar(false, false);
+
+            cargando(true, 'Actualizando capas desde PostGIS…');
+            try {
+                await recargarDatos();
+            } finally {
+                cargando(false);
+            }
+
+            if (creada?.clave) {
+                const detalle = asociadas
+                    ? `vinculada a ${asociadas} ruta${asociadas === 1 ? '' : 's'}`
+                    : 'sin rutas a 40 m o menos';
+                focusParada(creada.clave);
+                toast(`Parada ${creada.clave} creada · ${detalle}`, 5200);
+            } else {
+                toast('Parada creada correctamente.', 4000);
+            }
+        } catch (error) {
+            console.error(error);
+            toast(`No se pudo guardar la parada: ${error.message}`, 6000);
+            if (boton) {
+                boton.disabled = false;
+                boton.textContent = 'Guardar parada';
+            }
+        }
+    }
+
+    async function eliminarParada(clave) {
+        if (!clave) return;
+        const confirmado = window.confirm(
+            `¿Eliminar la parada ${clave}? Esta acción no se puede deshacer.`
+        );
+        if (!confirmado) return;
+
+        try {
+            Estado.mapa?.closePopup();
+            cargando(true, 'Eliminando parada…');
+
+            const respuesta = await fetch(new URL(`${API}eliminar_parada.php`, window.location.href).toString(), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                cache: 'no-store',
+                body: JSON.stringify({ clave }),
+            });
+            const texto = await respuesta.text();
+            let json;
+            try {
+                json = JSON.parse(texto);
+            } catch (e) {
+                throw new Error('El servidor no respondió con JSON válido.');
+            }
+            if (!respuesta.ok || !json.ok) {
+                throw new Error(json.error || `Error ${respuesta.status}`);
+            }
+
+            const datos = json.data || {};
+            await recargarDatos();
+            toast(`Parada ${datos.clave || clave} eliminada · ${datos.nombre || ''}`.trim(), 4600);
+        } catch (error) {
+            console.error(error);
+            toast(`No se pudo eliminar la parada: ${error.message}`, 6000);
+        } finally {
+            cargando(false, 'Cargando capas desde PostGIS…');
+        }
+    }
+
+    async function recargarDatos() {
+        const [mapa, indicadores] = await Promise.all([
+            api('mapa.php'),
+            api('indicadores.php'),
+        ]);
+
+        Estado.datos = mapa;
+        Estado.ind = indicadores;
+        indexarDatos();
+
+        if (Estado.capaRutas) {
+            Estado.capaRutas.clearLayers();
+            Estado.capaRutas.addData(Estado.datos.rutas);
+        }
+        aplicarFiltroColonias();
+        reconstruirParadas();
+        actualizarCalor();
+
+        pintarTablero();
+        pintarLeyendas();
+        pintarListaColonias();
+        pintarInversion();
+
+        const chipRutas = $('#capaNumRutas');
+        if (chipRutas) chipRutas.textContent = `${Estado.rutas.length}`;
+
+        // Refresca el panel si había un análisis activo (alta/baja de paradas).
+        if (Estado.analisis?.punto) {
+            await analizar(Estado.analisis.punto.lon, Estado.analisis.punto.lat, { ajustar: false });
+        }
+    }
+
     function irAColonia(clave) {
         const flotante = $('#panelResultado');
         if (flotante) flotante.hidden = true;
         abrirTab('colonias');
         Estado.filtroColonias = 'todas';
+        Estado.filtroTipoColonia = 'todos';
         Estado.busquedaColonia = '';
         const input = $('#buscarColonia');
         if (input) input.value = '';
+        const selectTipo = $('#filtroTipoColonia');
+        if (selectTipo) selectTipo.value = 'todos';
         marcarSegmentado('#filtroColonias', 'todas');
         aplicarFiltroColonias();
         pintarListaColonias();
@@ -1474,8 +2123,7 @@
     function coloniasFiltradas() {
         const q = normalizar(Estado.busquedaColonia);
         const lista = Estado.colonias.filter((c) => {
-            if (Estado.filtroColonias === 'con' && !c.cobertura) return false;
-            if (Estado.filtroColonias === 'sin' && c.cobertura) return false;
+            if (!coloniaPasaFiltros(c)) return false;
             if (q && !normalizar(`${c.nombre} ${c.clave}`).includes(q)) return false;
             return true;
         });
@@ -1595,6 +2243,12 @@
         const escenario = calcularEscenario();
         const { candidatos, financiadas, beneficiada, ejercida, restante, pctFinal, pctActual } = escenario;
         const total = candidatos.length;
+
+        // Refleja en el mapa las colonias que el presupuesto alcanza a financiar.
+        Estado.coloniasFinanciadas = new Set(
+            candidatos.filter((c) => c.financiada).map((c) => c.clave)
+        );
+        aplicarEstiloInversion();
 
         const resumen = $('#resumenInversion');
         if (resumen) {
@@ -1874,6 +2528,8 @@
     /* ---------------------------------------------------------------------- */
 
     function abrirTab(nombre) {
+        const anterior = Estado.tabActual;
+        Estado.tabActual = nombre;
         $$('.tabs__btn').forEach((boton) => {
             const activo = boton.dataset.tab === nombre;
             boton.classList.toggle('is-activo', activo);
@@ -1881,6 +2537,87 @@
         });
         $$('.tab-panel').forEach((panel) => {
             panel.hidden = panel.id !== `tab-${nombre}`;
+        });
+        if (nombre === 'inversion') {
+            // Asegura que las colonias candidatas (sin cobertura) se vean al simular.
+            asegurarCapa('#chkColonias', Estado.capaColonias);
+            if (Estado.filtroColonias === 'con') {
+                filtrarColonias('todas');
+            }
+        }
+        // Sólo se toca el estilo de colonias al entrar o salir de Inversión.
+        if (anterior === 'inversion' || nombre === 'inversion') {
+            aplicarEstiloInversion();
+        }
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Radio de cobertura sincronizado                                        */
+    /* ---------------------------------------------------------------------- */
+
+    function actualizarRadioUI(valor) {
+        const radio = Math.max(50, Math.min(2000, Math.round(Number(valor) || 300)));
+        Estado.radio = radio;
+        const texto = `${radio} m`;
+
+        ['#radioTexto', '#radioTextoMini'].forEach((selector) => {
+            const el = $(selector);
+            if (el) el.textContent = texto;
+        });
+        ['#radioRange', '#radioRangeMini'].forEach((selector) => {
+            const el = $(selector);
+            if (el && Number(el.value) !== radio) el.value = String(radio);
+        });
+
+        const vacio = $('#vacioRadio');
+        if (vacio) vacio.textContent = texto;
+
+        $$('.chip-radio[data-radio]').forEach((boton) => {
+            boton.classList.toggle('is-activo', Number(boton.dataset.radio) === radio);
+        });
+    }
+
+    function actualizarCirculoRadio() {
+        if (Estado.circuloAnalisis) Estado.circuloAnalisis.setRadius(Estado.radio);
+    }
+
+    function recalcularRadioAhora() {
+        clearTimeout(Estado.radioTimer);
+        if (Estado.analisis?.punto) {
+            analizar(Estado.analisis.punto.lon, Estado.analisis.punto.lat, { ajustar: false });
+        }
+    }
+
+    function programarRecalculoRadio() {
+        clearTimeout(Estado.radioTimer);
+        Estado.radioTimer = setTimeout(() => {
+            if (Estado.analisis?.punto) {
+                analizar(Estado.analisis.punto.lon, Estado.analisis.punto.lat, { ajustar: false });
+            }
+        }, 220);
+    }
+
+    function aplicarRadio(valor, { recalcular = 'debounce' } = {}) {
+        actualizarRadioUI(valor);
+        actualizarCirculoRadio();
+        if (recalcular === 'ahora') recalcularRadioAhora();
+        else if (recalcular === 'debounce') programarRecalculoRadio();
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Estilo de colonias financiadas                                         */
+    /* ---------------------------------------------------------------------- */
+
+    function aplicarEstiloInversion() {
+        if (!Estado.capaColonias) return;
+        const enInversion = Estado.tabActual === 'inversion';
+        Estado.capaColonias.eachLayer((capa) => {
+            const p = capa.feature?.properties;
+            if (!p) return;
+            capa.setStyle(estiloColonia(capa.feature));
+            if (enInversion && !p.cobertura && Estado.coloniasFinanciadas.has(p.clave)) {
+                capa.bringToFront();
+            }
         });
     }
 
@@ -1918,6 +2655,20 @@
             Estado.paradasTodas = evento.target.checked;
             reconstruirParadas();
         });
+        $('#filtroTipoParada')?.addEventListener('change', (evento) => {
+            Estado.filtroTipoParada = evento.target.value || 'todas';
+            reconstruirParadas();
+        });
+
+        // Mapa de calor
+        $('#chkCalor')?.addEventListener('change', (evento) => alternarCalor(evento.target.checked));
+        $('#btnCalor')?.addEventListener('click', () => alternarCalor(!Estado.calorActivo));
+        $('#modoCalor')?.addEventListener('change', (evento) => cambiarModoCalor(evento.target.value));
+
+        // Agregar parada con un clic
+        ['#btnAgregarParada', '#btnAgregarParadaPanel'].forEach((selector) => {
+            $(selector)?.addEventListener('click', () => activarModoAgregar(!Estado.modoAgregar));
+        });
 
         // Mapas base
         $$('#basemaps [data-basemap]').forEach((boton) => {
@@ -1929,39 +2680,38 @@
             $(selector)?.addEventListener('click', ubicarme);
         });
 
-        // Radio
-        const selectorRadio = $('#radioSelect');
-        const radios = Array.isArray(CFG_MAPA.radios) && CFG_MAPA.radios.length
-            ? CFG_MAPA.radios
-            : [150, 300, 500, 800];
-        if (selectorRadio) {
-            selectorRadio.innerHTML = radios.map((r) => (
-                `<option value="${r}"${Number(r) === Estado.radio ? ' selected' : ''}>${r} m${Number(r) === 300 ? ' (recomendado)' : ''}</option>`
-            )).join('');
-            selectorRadio.addEventListener('change', (evento) => {
-                Estado.radio = Number(evento.target.value);
-                const vacio = $('#vacioRadio');
-                if (vacio) vacio.textContent = `${Estado.radio} m`;
-                if (Estado.analisis && Estado.analisis.punto) {
-                    analizar(Estado.analisis.punto.lon, Estado.analisis.punto.lat, { ajustar: true });
-                }
+        // Radio de cobertura: slider libre y mini slider sincronizados.
+        ['#radioRange', '#radioRangeMini'].forEach((selector) => {
+            const slider = $(selector);
+            if (!slider) return;
+            slider.addEventListener('input', (evento) => {
+                aplicarRadio(evento.target.value, { recalcular: 'debounce' });
             });
-        }
-        const vacio = $('#vacioRadio');
-        if (vacio) vacio.textContent = `${Estado.radio} m`;
+            slider.addEventListener('change', (evento) => {
+                aplicarRadio(evento.target.value, { recalcular: 'ninguno' });
+                recalcularRadioAhora();
+            });
+        });
+        $$('.chip-radio[data-radio]').forEach((boton) => {
+            boton.addEventListener('click', () => {
+                aplicarRadio(boton.dataset.radio, { recalcular: 'ninguno' });
+                recalcularRadioAhora();
+            });
+        });
+        actualizarRadioUI(Estado.radio);
 
         // Punto de demostración
         $('#btnPuntoDemo')?.addEventListener('click', () => {
             analizar(-99.5008, 17.5513, { ajustar: true });
         });
 
-        // Resultado flotante
-        $('#btnCerrarResultado')?.addEventListener('click', () => {
-            const panel = $('#panelResultado');
-            if (panel) panel.hidden = true;
-        });
+        // Resultado flotante: cerrar limpia el círculo y restaura las capas
+        $('#btnCerrarResultado')?.addEventListener('click', limpiarAnalisis);
 
         $('#btnVerTodo')?.addEventListener('click', verTodo);
+
+        // Banner del modo agregar
+        $('#btnCancelarModoAgregar')?.addEventListener('click', () => activarModoAgregar(false));
 
         // Leyenda
         const leyenda = $('#leyendaMapa');
@@ -1990,6 +2740,12 @@
             });
         });
 
+        $('#filtroTipoColonia')?.addEventListener('change', (evento) => {
+            Estado.filtroTipoColonia = evento.target.value || 'todos';
+            aplicarFiltroColonias();
+            pintarListaColonias();
+        });
+
         $('#buscarColonia')?.addEventListener('input', (evento) => {
             Estado.busquedaColonia = evento.target.value;
             pintarListaColonias();
@@ -2016,6 +2772,7 @@
         };
         $('#btnAyuda')?.addEventListener('click', abrirAyuda);
         $('#btnAyudaPie')?.addEventListener('click', abrirAyuda);
+        $$('.aviso-datos').forEach((aviso) => aviso.addEventListener('click', abrirAyuda));
         $('#btnCerrarAyuda')?.addEventListener('click', cerrarAyuda);
         dialogo?.addEventListener('click', (evento) => {
             if (evento.target === dialogo) cerrarAyuda();
@@ -2050,8 +2807,14 @@
             }
             if (evento.key === 'Escape') {
                 ocultarBuscador();
-                const resultado = $('#panelResultado');
-                if (resultado && !resultado.hidden) resultado.hidden = true;
+                const hayPopup = Boolean(Estado.mapa?._popup);
+                if (Estado.modoAgregar) {
+                    Estado.mapa?.closePopup();
+                    activarModoAgregar(false);
+                } else if (Estado.analisis && !hayPopup) {
+                    // Escape cierra el análisis y limpia el mapa, igual que la ×.
+                    limpiarAnalisis();
+                }
             }
         });
 
@@ -2133,6 +2896,10 @@
 
             case 'limpiar-analisis':
                 limpiarAnalisis();
+                break;
+
+            case 'eliminar-parada':
+                eliminarParada(clave);
                 break;
 
             case 'buscar-colonia':

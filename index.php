@@ -39,7 +39,7 @@ $configJs = [
     <link rel="stylesheet" href="assets/css/app.css">
 </head>
 <body>
-<a class="salto" href="#tablero">Saltar al tablero</a>
+<a class="salto" href="#tab-tablero">Saltar al tablero</a>
 
 <header class="topbar">
     <div class="topbar__marca">
@@ -51,6 +51,11 @@ $configJs = [
     </div>
 
     <div class="topbar__acciones">
+        <button type="button" class="aviso-datos" id="avisoDatos"
+                title="Las coordenadas, trazos, tarifas y poblaciones son datos ficticios con fines académicos">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.5 20h19L12 3Z"/><path d="M12 9v5"/><circle cx="12" cy="17" r="1"/></svg>
+            <span>Aviso: Datos ficticios</span>
+        </button>
         <span class="estado-db" id="estadoDb" title="Estado de la conexión con PostGIS">
             <i class="estado-db__punto"></i><span id="estadoDbTexto">Conectando…</span>
         </span>
@@ -227,13 +232,51 @@ $configJs = [
                             </label>
                         </li>
                         <li class="capa--secundaria">
+                            <label class="campo campo--filtro">
+                                <span>Filtrar paradas por tipo</span>
+                                <select id="filtroTipoParada">
+                                    <option value="todas">Todos los tipos</option>
+                                    <option value="terminal">Terminal</option>
+                                    <option value="base">Base</option>
+                                    <option value="parada_autorizada">Parada autorizada</option>
+                                </select>
+                            </label>
+                        </li>
+                        <li class="capa--secundaria">
                             <label class="capa">
                                 <span class="capa__texto"><strong>Mostrar inactivas y propuestas</strong><em>Paradas fuera de operación</em></span>
                                 <input type="checkbox" id="chkParadasTodas" checked>
                                 <span class="switch" aria-hidden="true"></span>
                             </label>
                         </li>
+                        <li>
+                            <label class="capa">
+                                <span class="capa__muestra capa__muestra--calor"></span>
+                                <span class="capa__texto"><strong>Mapa de calor</strong><em>Densidad en tiempo real</em></span>
+                                <input type="checkbox" id="chkCalor">
+                                <span class="switch" aria-hidden="true"></span>
+                            </label>
+                        </li>
+                        <li class="capa--secundaria">
+                            <label class="campo campo--filtro">
+                                <span>Fuente del mapa de calor</span>
+                                <select id="modoCalor">
+                                    <option value="transporte">Densidad de paradas y rutas</option>
+                                    <option value="poblacion">Población y demanda</option>
+                                </select>
+                            </label>
+                            <p class="nota nota--compacta">Azul = menor densidad · Rojo = mayor concentración.</p>
+                        </li>
                     </ul>
+                </article>
+
+                <article class="tarjeta">
+                    <header class="tarjeta__cab"><h3>Agregar datos</h3></header>
+                    <p class="nota">Activa el modo y toca el mapa para guardar una parada nueva en PostGIS. Si queda a 40 m o menos de una ruta, se vincula automáticamente.</p>
+                    <button type="button" class="btn btn--guinda" id="btnAgregarParadaPanel" aria-pressed="false">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                        Agregar parada con un clic
+                    </button>
                 </article>
 
                 <article class="tarjeta">
@@ -271,10 +314,20 @@ $configJs = [
 
                 <article class="tarjeta">
                     <header class="tarjeta__cab"><h3>Punto de análisis</h3></header>
-                    <label class="campo">
-                        <span>Radio de cobertura</span>
-                        <select id="radioSelect"></select>
+                    <label class="campo campo--presupuesto campo--radio">
+                        <span>Radio de cobertura <b id="radioTexto">300 m</b></span>
+                        <input type="range" id="radioRange" min="50" max="2000" step="10" value="300"
+                               aria-label="Radio de cobertura en metros">
                     </label>
+                    <div class="radio-marcas" aria-hidden="true">
+                        <span>50 m</span><span>300 m</span><span>1000 m</span><span>2000 m</span>
+                    </div>
+                    <div class="radio-rapidos" role="group" aria-label="Radios rápidos">
+                        <button type="button" class="chip-radio" data-radio="150">150 m</button>
+                        <button type="button" class="chip-radio is-activo" data-radio="300">300 m</button>
+                        <button type="button" class="chip-radio" data-radio="500">500 m</button>
+                        <button type="button" class="chip-radio" data-radio="1000">1000 m</button>
+                    </div>
                     <div class="botones">
                         <button type="button" class="btn btn--guinda" id="btnUbicacionPanel">
                             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s7-5.4 7-11a7 7 0 1 0-14 0c0 5.6 7 11 7 11Z"/><circle cx="12" cy="10" r="2.5"/></svg>
@@ -306,6 +359,15 @@ $configJs = [
                         <button type="button" class="segmentado__btn" data-filtro="con">Con cobertura</button>
                         <button type="button" class="segmentado__btn" data-filtro="sin">Sin cobertura</button>
                     </div>
+                    <label class="campo campo--filtro">
+                        <span>Tipo de asentamiento</span>
+                        <select id="filtroTipoColonia">
+                            <option value="todos">Todos los tipos: Barrio, Colonia, Zona</option>
+                            <option value="colonia">Colonia</option>
+                            <option value="barrio">Barrio</option>
+                            <option value="zona">Zona</option>
+                        </select>
+                    </label>
                     <label class="buscador-mini">
                         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16 16 4 4"/></svg>
                         <input type="search" id="buscarColonia" placeholder="Buscar colonia…" autocomplete="off">
@@ -383,7 +445,11 @@ $configJs = [
         </div>
 
         <footer class="panel__pie">
-            <span>Datos demo del script <code>geo_chilp.sql</code> · PostGIS + Leaflet</span>
+            <span>Datos demo · <code>geo_chilp.sql</code></span>
+            <button type="button" class="aviso-datos aviso-datos--pie" id="avisoDatosPie"
+                    title="Las coordenadas, trazos, tarifas y poblaciones son datos ficticios con fines académicos">
+                Aviso: Datos ficticios
+            </button>
             <button type="button" class="enlace" id="btnAyudaPie">Simbología</button>
         </footer>
     </aside>
@@ -403,10 +469,26 @@ $configJs = [
         <div class="mapa-ui mapa-ui--herramientas">
             <button type="button" class="boton-mapa" id="btnVerTodo" title="Ver toda la ciudad" aria-label="Ver toda la ciudad">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+                <span>Ver todo</span>
+            </button>
+            <button type="button" class="boton-mapa" id="btnCalor" title="Mapa de calor" aria-label="Activar o desactivar el mapa de calor" aria-pressed="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21c4 0 6.5-2.7 6.5-6.2 0-3.2-2.4-5.6-4.2-7.9-.5 1.9-1.6 3-3.1 4.1.2-2.6-.7-4.8-2.2-6.5-.2 3.5-3.5 6.3-3.5 10.3C5.5 18.3 8 21 12 21Z"/><circle cx="12" cy="16" r="2.2"/></svg>
+                <span>Calor</span>
+            </button>
+            <button type="button" class="boton-mapa" id="btnAgregarParada" title="Agregar parada con un clic" aria-label="Agregar parada con un clic" aria-pressed="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                <span>+ Parada</span>
             </button>
             <button type="button" class="boton-mapa" id="btnLeyenda" title="Mostrar u ocultar leyenda" aria-label="Mostrar u ocultar leyenda">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 6 6-2 6 2 6-2v14l-6 2-6-2-6 2V6Z"/><path d="M9 4v14M15 6v14"/></svg>
+                <span>Leyenda</span>
             </button>
+        </div>
+
+        <div class="banner-agregar" id="bannerModoAgregar" hidden>
+            <span class="banner-agregar__icono" aria-hidden="true">+</span>
+            <p>Modo agregar activo: haz clic en cualquier punto del mapa para ubicar la nueva parada</p>
+            <button type="button" class="btn btn--linea btn--mini" id="btnCancelarModoAgregar">Cancelar</button>
         </div>
 
         <aside class="leyenda-mapa" id="leyendaMapa" aria-label="Leyenda del mapa">
@@ -422,6 +504,12 @@ $configJs = [
                 <span class="resultado__etiqueta">Análisis de cobertura</span>
                 <button type="button" class="resultado__cerrar" id="btnCerrarResultado" aria-label="Cerrar análisis">×</button>
             </header>
+            <div class="resultado__radio">
+                <label for="radioRangeMini">Radio</label>
+                <input type="range" id="radioRangeMini" min="50" max="2000" step="10" value="300"
+                       aria-label="Ajustar el radio de cobertura desde el panel de resultados">
+                <b id="radioTextoMini">300 m</b>
+            </div>
             <div class="resultado__cuerpo" id="resultadoCuerpo"></div>
         </section>
 
@@ -453,8 +541,10 @@ $configJs = [
         <ul class="lista-ayuda">
             <li><strong>Rutas:</strong> cada línea usa el color oficial guardado en <code>rutas_urvan.color_hex</code>. Las rutas inactivas se dibujan punteadas.</li>
             <li><strong>Paradas:</strong> terminal (bandera), base (casa) y parada autorizada (señal). Gris = inactiva; dorado punteado = propuesta.</li>
-            <li><strong>Colonias:</strong> verde = cobertura (más intenso, más rutas); rojo rayado = sin ninguna ruta activa.</li>
-            <li><strong>Consulta:</strong> al tocar el mapa se dibuja un círculo de 300 m (editable) y se resaltan sólo las rutas que pasan dentro, con la caminata a la parada más cercana.</li>
+            <li><strong>Colonias:</strong> verde = cobertura (más intenso, más rutas); rojo rayado = sin ninguna ruta activa; ámbar punteado = financiada en el simulador de inversión.</li>
+            <li><strong>Consulta:</strong> al tocar el mapa se dibuja un círculo ajustable con una barra de radio libre de <strong>50 a 2000 m</strong> y se resaltan sólo las rutas que pasan dentro, con la caminata a la parada más cercana.</li>
+            <li><strong>Mapa de calor:</strong> el botón <em>Calor</em> muestra la densidad de paradas y rutas o la demanda poblacional, según el modo elegido en la pestaña Capas.</li>
+            <li><strong>Agregar / Eliminar paradas:</strong> el botón <em>+ Parada</em> permite registrar puntos en PostGIS con un clic (vinculación automática a rutas a ≤ 40 m) y la ficha de cada parada incluye la opción <em>Eliminar</em>.</li>
             <li><strong>Inversión:</strong> las colonias sin cobertura se ordenan por costo por habitante para apoyar decisiones presupuestales.</li>
         </ul>
         <p class="nota">Aviso: la información del script es ficticia y sirve para demostrar el funcionamiento. Los costos de inversión son supuestos editables.</p>
